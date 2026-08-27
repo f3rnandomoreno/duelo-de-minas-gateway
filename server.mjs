@@ -16,14 +16,51 @@ export function createGatewayServer(options = {}) {
     ws: true,
     secure: true,
     xfwd: true,
+    selfHandleResponse: true,
   });
 
   proxy.on('proxyReq', proxyRequest => {
     proxyRequest.setHeader('X-Duelo-Gateway', 'render');
+    proxyRequest.setHeader('Accept-Encoding', 'identity');
   });
 
   proxy.on('proxyReqWs', proxyRequest => {
     proxyRequest.setHeader('X-Duelo-Gateway', 'render');
+  });
+
+  proxy.on('proxyRes', (proxyResponse, request, response) => {
+    const chunks = [];
+    proxyResponse.on('data', chunk => chunks.push(chunk));
+    proxyResponse.on('end', () => {
+      let body = Buffer.concat(chunks);
+      const contentType = String(proxyResponse.headers['content-type'] || '');
+      if (contentType.includes('application/json')) {
+        try {
+          const data = JSON.parse(body.toString('utf8'));
+          if (data && typeof data.wsUrl === 'string') {
+            const forwardedProtocol = String(request.headers['x-forwarded-proto'] || 'https')
+              .split(',')[0].trim();
+            const host = String(request.headers['x-forwarded-host'] || request.headers.host)
+              .split(',')[0].trim();
+            const wsUrl = new URL(data.wsUrl);
+            wsUrl.protocol = forwardedProtocol === 'http' ? 'ws:' : 'wss:';
+            wsUrl.host = host;
+            data.wsUrl = wsUrl.toString();
+            body = Buffer.from(JSON.stringify(data));
+          }
+        } catch {
+          // Preserve a non-JSON upstream response even if its header is wrong.
+        }
+      }
+
+      const headers = { ...proxyResponse.headers };
+      delete headers.connection;
+      delete headers['content-length'];
+      delete headers['transfer-encoding'];
+      headers['content-length'] = String(body.length);
+      response.writeHead(proxyResponse.statusCode || 502, headers);
+      response.end(body);
+    });
   });
 
   const server = http.createServer((request, response) => {
